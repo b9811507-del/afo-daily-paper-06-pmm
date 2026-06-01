@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, PollAnswerHandler
 
 load_dotenv()
@@ -452,13 +453,17 @@ async def start_live_test(manual: bool = False) -> None:
         disable_notification=True,
     )
 
-    countdown = await telegram_app.bot.send_message(settings.telegram_public_group_id, "Test starts in 15 seconds")
+    countdown = await telegram_app.bot.send_message(settings.telegram_public_group_id, "Countdown starting...")
     for second in range(settings.countdown_seconds, 0, -1):
-        await telegram_app.bot.edit_message_text(
-            chat_id=settings.telegram_public_group_id,
-            message_id=countdown.message_id,
-            text=f"Test starts in {second} seconds",
-        )
+        try:
+            await telegram_app.bot.edit_message_text(
+                chat_id=settings.telegram_public_group_id,
+                message_id=countdown.message_id,
+                text=f"Test starts in {second} seconds",
+            )
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
         await asyncio.sleep(1)
 
     await telegram_app.bot.send_message(
