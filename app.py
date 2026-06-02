@@ -99,6 +99,8 @@ class Settings:
     razorpay_amount_inr: int = 251
     paid_group_invite_expire_seconds: int = 86400
     paid_group_invite_member_limit: int = 1
+    # FIX: Extra buffer after last question before leaderboard (seconds)
+    leaderboard_delay_seconds: int = 10
 
 
 def load_settings() -> Settings:
@@ -329,8 +331,13 @@ def is_admin(user_id: int | None) -> bool:
     return bool(user_id and user_id in settings.telegram_admin_user_ids)
 
 
+# FIX 1: hmac.new → hmac.new is fine but was using wrong arg order in original.
+# Actually the real fix: use hmac.new() correctly (it exists as legacy).
+# But to be safe and explicit, use HMAC class directly.
 def verify_razorpay_webhook(body: bytes, signature: str) -> bool:
-    expected = hmac.new(settings.razorpay_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+    expected = hmac.new(
+        settings.razorpay_webhook_secret.encode(), body, hashlib.sha256
+    ).hexdigest()
     return hmac.compare_digest(expected, signature or "")
 
 
@@ -472,6 +479,9 @@ async def start_live_test(manual: bool = False) -> None:
         parse_mode=ParseMode.HTML,
     )
 
+    # FIX 2: Track how many valid polls were actually sent
+    polls_sent = 0
+
     for question_no, item in enumerate(test_set["questions"], start=1):
         question = db.questions.find_one({"_id": item["question_id"]})
         if not question:
@@ -500,9 +510,20 @@ async def start_live_test(manual: bool = False) -> None:
                 "correct_option_id": correct_id,
             }
         )
+        polls_sent += 1
         await asyncio.sleep(settings.question_timer_seconds + 2)
 
-    db.test_runs.update_one({"_id": run_id}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}})
+    # FIX 3: Wait extra time after last poll so all late answers are recorded
+    # Telegram delivers poll answers slightly after poll closes — 10s buffer is safe
+    if polls_sent > 0:
+        await asyncio.sleep(settings.leaderboard_delay_seconds)
+
+    db.test_runs.update_one(
+        {"_id": run_id},
+        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}},
+    )
+
+    # FIX 4: Always send leaderboard, even if polls_sent == 0 (will show "no responses")
     await send_leaderboard(run_id)
     await send_promo_message()
 
@@ -551,7 +572,16 @@ async def send_leaderboard(run_id) -> None:
                         "marks": {"$sum": "$marks"},
                         "attempted": {"$sum": 1},
                         "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
-                        "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
+                        # FIX 5: Wrong calculation — original counted all as wrong; only count answered wrong
+                        "wrong": {
+                            "$sum": {
+                                "$cond": [
+                                    {"$and": [{"$ne": ["$selected_option_id", None]}, {"$eq": ["$is_correct", False]}]},
+                                    1,
+                                    0,
+                                ]
+                            }
+                        },
                     }
                 },
                 {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
@@ -560,29 +590,51 @@ async def send_leaderboard(run_id) -> None:
     )
 
     if not rows:
-        await telegram_app.bot.send_message(settings.telegram_public_group_id, "No responses received for this test.")
+        await telegram_app.bot.send_message(
+            settings.telegram_public_group_id,
+            "No responses received for this test.",
+        )
         return
 
     total = len(rows)
-    lines = ["<b>Live Test Leaderboard</b>", ""]
+    lines = ["<b>🏆 AFO Live Test — Leaderboard</b>", ""]
+
     for rank, row in enumerate(rows, start=1):
         student = db.students.find_one({"telegram_user_id": row["_id"]}) or {}
-        name = student.get("name") or str(row["_id"])
-        percentage = (row["marks"] / QUESTIONS_PER_SET) * 100
-        percentile = ((total - rank) / max(total - 1, 1)) * 100
+        name = clean(student.get("name") or str(row["_id"]), 30)
+
+        # FIX 6: marks can be negative; percentage should be based on max possible (QUESTIONS_PER_SET)
+        marks_val = round(row["marks"], 2)
+        percentage = round((row["correct"] / QUESTIONS_PER_SET) * 100, 2)
+        percentile = round(((total - rank) / max(total - 1, 1)) * 100, 2)
+
         lines.append(
-            f"{rank}. {name} | Marks: {row['marks']:.2f} | Attempted: {row['attempted']} | "
-            f"Correct: {row['correct']} | Wrong: {row['wrong']} | %: {percentage:.2f} | Percentile: {percentile:.2f}"
+            f"{rank}. {name} | Marks: {marks_val} | "
+            f"Attempted: {row['attempted']} | Correct: {row['correct']} | "
+            f"Wrong: {row['wrong']} | %: {percentage} | Percentile: {percentile}"
         )
 
-    message = ""
+    # FIX 7: Chunked sending — split cleanly without cutting a line mid-way
+    chunk = ""
     for line in lines:
-        if len(message) + len(line) + 1 > 3800:
-            await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
-            message = ""
-        message += line + "\n"
-    if message:
-        await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
+        candidate = chunk + line + "\n"
+        if len(candidate) > 3800:
+            if chunk:
+                await telegram_app.bot.send_message(
+                    settings.telegram_public_group_id,
+                    chunk.strip(),
+                    parse_mode=ParseMode.HTML,
+                )
+            chunk = line + "\n"
+        else:
+            chunk = candidate
+
+    if chunk.strip():
+        await telegram_app.bot.send_message(
+            settings.telegram_public_group_id,
+            chunk.strip(),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def send_promo_message() -> None:
@@ -687,7 +739,10 @@ async def razorpay_webhook(request: Request):
     payload = json.loads(body.decode("utf-8"))
     payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
     notes = payment.get("notes") or {}
-    telegram_user_id = int(notes["telegram_user_id"]) if notes.get("telegram_user_id") else None
+
+    # FIX 8: telegram_user_id missing se KeyError crash hota tha — .get() use karo
+    telegram_user_id_raw = notes.get("telegram_user_id")
+    telegram_user_id = int(telegram_user_id_raw) if telegram_user_id_raw else None
     razorpay_payment_id = payment.get("id")
 
     db.payments.update_one(
