@@ -16,7 +16,8 @@ import razorpay
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING, DESCENDING
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -99,8 +100,6 @@ class Settings:
     razorpay_amount_inr: int = 251
     paid_group_invite_expire_seconds: int = 86400
     paid_group_invite_member_limit: int = 1
-    # FIX: Extra buffer after last question before leaderboard (seconds)
-    leaderboard_delay_seconds: int = 10
 
 
 def load_settings() -> Settings:
@@ -122,23 +121,23 @@ def load_settings() -> Settings:
 
 
 settings = load_settings()
-mongo = MongoClient(settings.mongodb_uri)
+mongo = AsyncIOMotorClient(settings.mongodb_uri)
 db = mongo[settings.mongodb_db_name]
 razorpay_client = razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
 
 
-def ensure_indexes() -> None:
-    db.questions.create_index([("topic", ASCENDING)])
-    db.test_sets.create_index([("set_no", ASCENDING)], unique=True)
-    db.test_runs.create_index([("run_key", ASCENDING)], unique=True)
-    db.poll_map.create_index([("poll_id", ASCENDING)], unique=True)
-    db.responses.create_index(
+async def ensure_indexes() -> None:
+    await db.questions.create_index([("topic", ASCENDING)])
+    await db.test_sets.create_index([("set_no", ASCENDING)], unique=True)
+    await db.test_runs.create_index([("run_key", ASCENDING)], unique=True)
+    await db.poll_map.create_index([("poll_id", ASCENDING)], unique=True)
+    await db.responses.create_index(
         [("run_id", ASCENDING), ("telegram_user_id", ASCENDING), ("question_no", ASCENDING)],
         unique=True,
     )
-    db.students.create_index([("telegram_user_id", ASCENDING)], unique=True)
-    db.payments.create_index([("razorpay_payment_id", ASCENDING)], unique=True, sparse=True)
-    db.invites.create_index([("telegram_user_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.students.create_index([("telegram_user_id", ASCENDING)], unique=True)
+    await db.payments.create_index([("razorpay_payment_id", ASCENDING)], unique=True, sparse=True)
+    await db.invites.create_index([("telegram_user_id", ASCENDING), ("created_at", DESCENDING)])
 
 
 def normalize_topic(topic: str) -> str:
@@ -165,8 +164,9 @@ def fetch_sheet_rows() -> list[dict]:
     return list(csv.DictReader(StringIO(response.text)))
 
 
-def import_questions_from_sheet() -> int:
-    rows = fetch_sheet_rows()
+async def import_questions_from_sheet() -> int:
+    # Run the blocking network request in a separate thread so it doesn't freeze the bot
+    rows = await asyncio.to_thread(fetch_sheet_rows)
     questions = []
     skipped_topics = defaultdict(int)
 
@@ -201,11 +201,11 @@ def import_questions_from_sheet() -> int:
             }
         )
 
-    db.questions.delete_many({})
+    await db.questions.delete_many({})
     if questions:
-        db.questions.insert_many(questions)
+        await db.questions.insert_many(questions)
 
-    db.import_logs.insert_one(
+    await db.import_logs.insert_one(
         {
             "imported": len(questions),
             "skipped_topics": dict(skipped_topics),
@@ -250,11 +250,11 @@ def build_topic_plans() -> list[list[str]]:
     return plans
 
 
-def load_question_queues(seed: int) -> dict[str, deque]:
+async def load_question_queues(seed: int) -> dict[str, deque]:
     rng = Random(seed)
     by_topic = defaultdict(list)
 
-    for question in db.questions.find({}):
+    async for question in db.questions.find({}):
         topic = normalize_topic(question.get("topic", ""))
         if topic in TOPIC_TOTAL_USE:
             question["topic"] = topic
@@ -275,10 +275,10 @@ def load_question_queues(seed: int) -> dict[str, deque]:
     return queues
 
 
-def build_test_sets(seed: int = 2026) -> int:
+async def build_test_sets(seed: int = 2026) -> int:
     plans = build_topic_plans()
-    queues = load_question_queues(seed)
-    db.test_sets.delete_many({})
+    queues = await load_question_queues(seed)
+    await db.test_sets.delete_many({})
 
     created = 0
     for set_no, topic_plan in enumerate(plans, start=1):
@@ -300,7 +300,7 @@ def build_test_sets(seed: int = 2026) -> int:
         if len(selected) != QUESTIONS_PER_SET:
             raise RuntimeError(f"Set {set_no} has {len(selected)} questions, expected 60")
 
-        db.test_sets.insert_one({"set_no": set_no, "questions": selected})
+        await db.test_sets.insert_one({"set_no": set_no, "questions": selected})
         created += 1
 
     return created
@@ -331,13 +331,8 @@ def is_admin(user_id: int | None) -> bool:
     return bool(user_id and user_id in settings.telegram_admin_user_ids)
 
 
-# FIX 1: hmac.new → hmac.new is fine but was using wrong arg order in original.
-# Actually the real fix: use hmac.new() correctly (it exists as legacy).
-# But to be safe and explicit, use HMAC class directly.
 def verify_razorpay_webhook(body: bytes, signature: str) -> bool:
-    expected = hmac.new(
-        settings.razorpay_webhook_secret.encode(), body, hashlib.sha256
-    ).hexdigest()
+    expected = hmac.new(settings.razorpay_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature or "")
 
 
@@ -349,7 +344,7 @@ async def start(update: Update, _context) -> None:
     if not user or not update.message:
         return
 
-    db.students.update_one(
+    await db.students.update_one(
         {"telegram_user_id": user.id},
         {
             "$set": {
@@ -391,21 +386,24 @@ async def pay(update: Update, _context) -> None:
 async def import_sheet(update: Update, _context) -> None:
     if not is_admin(update.effective_user.id if update.effective_user else None):
         return
-    count = await asyncio.to_thread(import_questions_from_sheet)
+    count = await import_questions_from_sheet()
     await update.message.reply_text(f"Imported {count} questions from Google Sheet.")
 
 
 async def build_sets_command(update: Update, _context) -> None:
     if not is_admin(update.effective_user.id if update.effective_user else None):
         return
-    count = await asyncio.to_thread(build_test_sets)
+    count = await build_test_sets()
     await update.message.reply_text(f"Built {count} mixed test sets. Each set has 60 questions.")
 
 
 async def stats(update: Update, _context) -> None:
     if not is_admin(update.effective_user.id if update.effective_user else None):
         return
-    topic_counts = list(db.questions.aggregate([{"$group": {"_id": "$topic", "count": {"$sum": 1}}}, {"$sort": {"_id": 1}}]))
+    
+    cursor = db.questions.aggregate([{"$group": {"_id": "$topic", "count": {"$sum": 1}}}, {"$sort": {"_id": 1}}])
+    topic_counts = await cursor.to_list(length=None)
+    
     lines = ["Question counts:"]
     for row in topic_counts:
         lines.append(f"{row['_id']}: {row['count']}")
@@ -427,11 +425,13 @@ async def start_live_test(manual: bool = False) -> None:
     today = datetime.now(ZoneInfo(settings.timezone)).date()
     run_key = f"{today.isoformat()}-manual-{int(datetime.now().timestamp())}" if manual else today.isoformat()
 
-    if not manual and db.test_runs.find_one({"run_key": run_key}):
+    if not manual and await db.test_runs.find_one({"run_key": run_key}):
         return
 
-    set_no = (db.test_runs.count_documents({"manual": False}) % TOTAL_SETS) + 1
-    test_set = db.test_sets.find_one({"set_no": set_no})
+    runs_count = await db.test_runs.count_documents({"manual": False})
+    set_no = (runs_count % TOTAL_SETS) + 1
+    
+    test_set = await db.test_sets.find_one({"set_no": set_no})
     if not test_set:
         await telegram_app.bot.send_message(
             settings.telegram_public_group_id,
@@ -439,7 +439,7 @@ async def start_live_test(manual: bool = False) -> None:
         )
         return
 
-    run_id = db.test_runs.insert_one(
+    result = await db.test_runs.insert_one(
         {
             "run_key": run_key,
             "set_no": set_no,
@@ -447,7 +447,8 @@ async def start_live_test(manual: bool = False) -> None:
             "status": "running",
             "started_at": datetime.now(timezone.utc),
         }
-    ).inserted_id
+    )
+    run_id = result.inserted_id
 
     announcement = await telegram_app.bot.send_message(
         settings.telegram_public_group_id,
@@ -479,11 +480,8 @@ async def start_live_test(manual: bool = False) -> None:
         parse_mode=ParseMode.HTML,
     )
 
-    # FIX 2: Track how many valid polls were actually sent
-    polls_sent = 0
-
     for question_no, item in enumerate(test_set["questions"], start=1):
-        question = db.questions.find_one({"_id": item["question_id"]})
+        question = await db.questions.find_one({"_id": item["question_id"]})
         if not question:
             continue
         correct_id = correct_option_id(question)
@@ -501,7 +499,7 @@ async def start_live_test(manual: bool = False) -> None:
             explanation=clean(question.get("explanation", ""), 200) or None,
         )
 
-        db.poll_map.insert_one(
+        await db.poll_map.insert_one(
             {
                 "poll_id": poll_message.poll.id,
                 "run_id": run_id,
@@ -510,27 +508,16 @@ async def start_live_test(manual: bool = False) -> None:
                 "correct_option_id": correct_id,
             }
         )
-        polls_sent += 1
         await asyncio.sleep(settings.question_timer_seconds + 2)
 
-    # FIX 3: Wait extra time after last poll so all late answers are recorded
-    # Telegram delivers poll answers slightly after poll closes — 10s buffer is safe
-    if polls_sent > 0:
-        await asyncio.sleep(settings.leaderboard_delay_seconds)
-
-    db.test_runs.update_one(
-        {"_id": run_id},
-        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}},
-    )
-
-    # FIX 4: Always send leaderboard, even if polls_sent == 0 (will show "no responses")
+    await db.test_runs.update_one({"_id": run_id}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}})
     await send_leaderboard(run_id)
     await send_promo_message()
 
 
 async def poll_answer(update: Update, _context) -> None:
     answer = update.poll_answer
-    poll_data = db.poll_map.find_one({"poll_id": answer.poll_id})
+    poll_data = await db.poll_map.find_one({"poll_id": answer.poll_id})
     if not poll_data or not answer.user:
         return
 
@@ -538,12 +525,13 @@ async def poll_answer(update: Update, _context) -> None:
     is_correct = selected == poll_data["correct_option_id"]
     marks = 1 if is_correct else -0.25
 
-    db.students.update_one(
+    await db.students.update_one(
         {"telegram_user_id": answer.user.id},
         {"$set": {"telegram_user_id": answer.user.id, "name": answer.user.full_name, "username": answer.user.username}},
         upsert=True,
     )
-    db.responses.update_one(
+    
+    await db.responses.update_one(
         {
             "run_id": poll_data["run_id"],
             "telegram_user_id": answer.user.id,
@@ -562,79 +550,47 @@ async def poll_answer(update: Update, _context) -> None:
 
 
 async def send_leaderboard(run_id) -> None:
-    rows = list(
-        db.responses.aggregate(
-            [
-                {"$match": {"run_id": run_id}},
-                {
-                    "$group": {
-                        "_id": "$telegram_user_id",
-                        "marks": {"$sum": "$marks"},
-                        "attempted": {"$sum": 1},
-                        "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
-                        # FIX 5: Wrong calculation — original counted all as wrong; only count answered wrong
-                        "wrong": {
-                            "$sum": {
-                                "$cond": [
-                                    {"$and": [{"$ne": ["$selected_option_id", None]}, {"$eq": ["$is_correct", False]}]},
-                                    1,
-                                    0,
-                                ]
-                            }
-                        },
-                    }
-                },
-                {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
-            ]
-        )
+    cursor = db.responses.aggregate(
+        [
+            {"$match": {"run_id": run_id}},
+            {
+                "$group": {
+                    "_id": "$telegram_user_id",
+                    "marks": {"$sum": "$marks"},
+                    "attempted": {"$sum": 1},
+                    "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
+                    "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
+                }
+            },
+            {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
+        ]
     )
+    rows = await cursor.to_list(length=None)
 
     if not rows:
-        await telegram_app.bot.send_message(
-            settings.telegram_public_group_id,
-            "No responses received for this test.",
-        )
+        await telegram_app.bot.send_message(settings.telegram_public_group_id, "No responses received for this test.")
         return
 
     total = len(rows)
-    lines = ["<b>🏆 AFO Live Test — Leaderboard</b>", ""]
-
+    lines = ["<b>Live Test Leaderboard</b>", ""]
     for rank, row in enumerate(rows, start=1):
-        student = db.students.find_one({"telegram_user_id": row["_id"]}) or {}
-        name = clean(student.get("name") or str(row["_id"]), 30)
-
-        # FIX 6: marks can be negative; percentage should be based on max possible (QUESTIONS_PER_SET)
-        marks_val = round(row["marks"], 2)
-        percentage = round((row["correct"] / QUESTIONS_PER_SET) * 100, 2)
-        percentile = round(((total - rank) / max(total - 1, 1)) * 100, 2)
-
+        student = await db.students.find_one({"telegram_user_id": row["_id"]}) or {}
+        name = student.get("name") or str(row["_id"])
+        percentage = (row["marks"] / QUESTIONS_PER_SET) * 100
+        percentile = ((total - rank) / max(total - 1, 1)) * 100
         lines.append(
-            f"{rank}. {name} | Marks: {marks_val} | "
-            f"Attempted: {row['attempted']} | Correct: {row['correct']} | "
-            f"Wrong: {row['wrong']} | %: {percentage} | Percentile: {percentile}"
+            f"{rank}. {name} | Marks: {row['marks']:.2f} | Attempted: {row['attempted']} | "
+            f"Correct: {row['correct']} | Wrong: {row['wrong']} | %: {percentage:.2f} | Percentile: {percentile:.2f}"
         )
 
-    # FIX 7: Chunked sending — split cleanly without cutting a line mid-way
-    chunk = ""
+    message = ""
     for line in lines:
-        candidate = chunk + line + "\n"
-        if len(candidate) > 3800:
-            if chunk:
-                await telegram_app.bot.send_message(
-                    settings.telegram_public_group_id,
-                    chunk.strip(),
-                    parse_mode=ParseMode.HTML,
-                )
-            chunk = line + "\n"
-        else:
-            chunk = candidate
-
-    if chunk.strip():
-        await telegram_app.bot.send_message(
-            settings.telegram_public_group_id,
-            chunk.strip(),
-            parse_mode=ParseMode.HTML,
-        )
+        if len(message) + len(line) + 1 > 3800:
+            await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
+            message = ""
+        message += line + "\n"
+    if message:
+        await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
 
 
 async def send_promo_message() -> None:
@@ -663,7 +619,8 @@ async def send_paid_invite(telegram_user_id: int) -> None:
         member_limit=settings.paid_group_invite_member_limit,
         creates_join_request=False,
     )
-    db.invites.insert_one(
+    
+    await db.invites.insert_one(
         {
             "telegram_user_id": telegram_user_id,
             "invite_link": invite.invite_link,
@@ -689,7 +646,7 @@ telegram_app.add_handler(PollAnswerHandler(poll_answer))
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    ensure_indexes()
+    await ensure_indexes()
     await telegram_app.initialize()
     await telegram_app.start()
 
@@ -739,13 +696,10 @@ async def razorpay_webhook(request: Request):
     payload = json.loads(body.decode("utf-8"))
     payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
     notes = payment.get("notes") or {}
-
-    # FIX 8: telegram_user_id missing se KeyError crash hota tha — .get() use karo
-    telegram_user_id_raw = notes.get("telegram_user_id")
-    telegram_user_id = int(telegram_user_id_raw) if telegram_user_id_raw else None
+    telegram_user_id = int(notes["telegram_user_id"]) if notes.get("telegram_user_id") else None
     razorpay_payment_id = payment.get("id")
 
-    db.payments.update_one(
+    await db.payments.update_one(
         {"razorpay_payment_id": razorpay_payment_id},
         {
             "$setOnInsert": {
@@ -762,7 +716,7 @@ async def razorpay_webhook(request: Request):
     )
 
     if payload.get("event") in {"payment.captured", "payment_link.paid"} and telegram_user_id:
-        db.students.update_one({"telegram_user_id": telegram_user_id}, {"$set": {"paid": True}}, upsert=True)
+        await db.students.update_one({"telegram_user_id": telegram_user_id}, {"$set": {"paid": True}}, upsert=True)
         await send_paid_invite(telegram_user_id)
 
     return {"ok": True}
