@@ -1,7 +1,7 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-telegram-bot[job-queue]==21.10
-pymongo[srv]==4.10.1
+motor==3.3.2
 requests==2.32.3
 python-dotenv==1.0.1
 razorpay==1.4.2
