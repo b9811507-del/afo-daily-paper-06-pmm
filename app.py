@@ -596,67 +596,90 @@ async def poll_answer(update: Update, _context) -> None:
         logger.error(f"Database error saving poll answer for {answer.user.id}: {e}")
 
 async def send_leaderboard(run_id) -> None:
-    logger.info(f"Generating leaderboard for run_id: {run_id} ({type(run_id)})")
-    
-    # Check if run_id exists in responses before aggregating
-    response_count = await db.responses.count_documents({"run_id": run_id})
-    logger.info(f"Found {response_count} total responses for this run_id.")
-
-    cursor = db.responses.aggregate([
-        {"$match": {"run_id": run_id}},
-        {
-            "$group": {
-                "_id": "$telegram_user_id",
-                "marks": {"$sum": "$marks"},
-                "attempted": {"$sum": 1},
-                "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
-                "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
-            }
-        },
-        {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
-    ])
-    
-    rows = await cursor.to_list(length=None)
+    rows = list(
+        db.responses.aggregate(
+            [
+                {"$match": {"run_id": run_id}},
+                {
+                    "$group": {
+                        "_id": "$telegram_user_id",
+                        "marks": {"$sum": "$marks"},
+                        "attempted": {"$sum": 1},
+                        "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
+                        "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
+                    }
+                },
+                {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
+            ]
+        )
+    )
 
     if not rows:
-        logger.warning(f"Leaderboard empty. Query returned 0 rows for run_id: {run_id}")
         await telegram_app.bot.send_message(settings.telegram_public_group_id, "No responses received for this test.")
         return
 
-    total = len(rows)
-    lines = ["<b>Live Test Leaderboard</b>\n"]
+    # Modern Header
+    lines = [
+        "🏆 <b>AFO LIVE TEST LEADERBOARD</b> 🏆", 
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    ]
+    
+    top_3_names = []
     
     for rank, row in enumerate(rows, start=1):
-        student = await db.students.find_one({"telegram_user_id": row["_id"]}) or {}
+        student = db.students.find_one({"telegram_user_id": row["_id"]}) or {}
+        name = student.get("name") or str(row["_id"])
         
-        # CRITICAL FIX: HTML Sanitization
-        raw_name = student.get("name") or str(row["_id"])
-        safe_name = html.escape(raw_name)
+        # Name ko clean rakhne ke liye 25 characters limit tak restrict karna
+        name = (name[:25] + '..') if len(name) > 25 else name
         
-        percentage = (row["marks"] / QUESTIONS_PER_SET) * 100
-        percentile = ((total - rank) / max(total - 1, 1)) * 100
+        # Save top 3 names for the congratulations message
+        if rank <= 3:
+            top_3_names.append(name)
         
-        lines.append(
-            f"{rank}. {safe_name} | Marks: {row['marks']:.2f} | Att: {row['attempted']} | "
-            f"✅: {row['correct']} | ❌: {row['wrong']} | %: {percentage:.2f} | %ile: {percentile:.2f}"
-        )
+        # Top 3 ko medals dena
+        if rank == 1:
+            rank_str = "🥇"
+        elif rank == 2:
+            rank_str = "🥈"
+        elif rank == 3:
+            rank_str = "🥉"
+        else:
+            rank_str = f"<b>{rank}.</b>"
+        
+        # Added 'Att' (Attempted) here
+        line = f"{rank_str} <b>{name}</b>\n└ 🎯 <b>{row['marks']:.2f}</b> | 📝 Att: {row['attempted']} | ✅ {row['correct']} | ❌ {row['wrong']}"
+        lines.append(line)
 
     message = ""
     for line in lines:
-        if len(message) + len(line) + 1 > 3800:
-            try:
-                await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
-            except Exception as e:
-                logger.error(f"Failed to send leaderboard chunk: {e}")
-            message = ""
-        message += line + "\n"
-    
-    if message:
-        try:
+        # Telegram character limit check (splits long leaderboards into multiple messages)
+        if len(message) + len(line) + 2 > 3800:
             await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.error(f"Failed to send final leaderboard chunk: {e}")
+            message = ""
+        message += line + "\n\n"
+        
+    if message:
+        await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
 
+    # Send the Congratulations Message for Top 3 (Without any buttons)
+    if top_3_names:
+        congrats_msg = "🎉 <b>CONGRATULATIONS TO OUR TOP 3 RANKERS!</b> 🎉\n\n"
+        
+        if len(top_3_names) >= 1:
+            congrats_msg += f"🥇 <b>Rank 1:</b> {top_3_names[0]}\n"
+        if len(top_3_names) >= 2:
+            congrats_msg += f"🥈 <b>Rank 2:</b> {top_3_names[1]}\n"
+        if len(top_3_names) >= 3:
+            congrats_msg += f"🥉 <b>Rank 3:</b> {top_3_names[2]}\n"
+            
+        congrats_msg += "\nKeep up the great work! 🚀"
+        
+        await telegram_app.bot.send_message(
+            settings.telegram_public_group_id, 
+            congrats_msg, 
+            parse_mode=ParseMode.HTML
+        )
 
 async def send_promo_message() -> None:
     try:
