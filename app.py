@@ -596,27 +596,33 @@ async def poll_answer(update: Update, _context) -> None:
         logger.error(f"Database error saving poll answer for {answer.user.id}: {e}")
 
 async def send_leaderboard(run_id) -> None:
-    # FIX 1: Correctly awaiting the async aggregation cursor
-    cursor = db.responses.aggregate(
-        [
-            {"$match": {"run_id": run_id}},
-            {
-                "$group": {
-                    "_id": "$telegram_user_id",
-                    "marks": {"$sum": "$marks"},
-                    "attempted": {"$sum": 1},
-                    "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
-                    "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
-                }
-            },
-            {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
-        ]
-    )
+    # BUG FIX 2: Async execution of MongoDB aggregation
+    cursor = db.responses.aggregate([
+        {"$match": {"run_id": run_id}},
+        {
+            "$group": {
+                "_id": "$telegram_user_id",
+                "marks": {"$sum": "$marks"},
+                "attempted": {"$sum": 1},
+                "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
+                "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
+            }
+        },
+        # BUG FIX 4: Sort by attempted (-1) for fairer tie-breaking
+        {"$sort": {"marks": -1, "correct": -1, "attempted": -1}},
+    ])
+    
     rows = await cursor.to_list(length=None)
 
     if not rows:
         await telegram_app.bot.send_message(settings.telegram_public_group_id, "No responses received for this test.")
         return
+
+    # BUG FIX 3: Preload all students in a single DB call (O(N) mapping, very fast)
+    student_ids = [row["_id"] for row in rows]
+    students_cursor = db.students.find({"telegram_user_id": {"$in": student_ids}})
+    students_list = await students_cursor.to_list(length=None)
+    student_map = {s["telegram_user_id"]: s for s in students_list}
 
     # Modern Header
     lines = [
@@ -627,14 +633,14 @@ async def send_leaderboard(run_id) -> None:
     top_3_names = []
     
     for rank, row in enumerate(rows, start=1):
-        # FIX 2: Added 'await' for the async find_one query
-        student = await db.students.find_one({"telegram_user_id": row["_id"]}) or {}
+        # Fetching pre-loaded student from mapping
+        student = student_map.get(row["_id"], {})
         name = student.get("name") or str(row["_id"])
         
-        # FIX 3: HTML escape the name to prevent ParseMode.HTML crashes
+        # HTML escaping to prevent ParseMode crash
         name = html.escape(name)
         
-        # Name ko clean rakhne ke liye 25 characters limit tak restrict karna
+        # Name restriction to keep UI clean
         name = (name[:25] + '..') if len(name) > 25 else name
         
         # Save top 3 names for the congratulations message
@@ -682,6 +688,7 @@ async def send_leaderboard(run_id) -> None:
             congrats_msg, 
             parse_mode=ParseMode.HTML
         )
+
 async def send_promo_message() -> None:
     try:
         bot_username = (await telegram_app.bot.get_me()).username
@@ -704,6 +711,13 @@ async def send_promo_message() -> None:
 
 async def send_paid_invite(telegram_user_id: int) -> None:
     try:
+        # Check to prevent duplicate invite link generation
+        existing_invite = await db.invites.find_one({"telegram_user_id": telegram_user_id})
+        if existing_invite and existing_invite.get("expire_date") and existing_invite["expire_date"] > datetime.now(timezone.utc):
+            logger.info(f"Active invite already exists for user {telegram_user_id}. Skipping duplicate creation.")
+            # Optionally resend existing link if needed, but not generating a new one.
+            return
+
         expire_date = datetime.now(timezone.utc) + timedelta(seconds=settings.paid_group_invite_expire_seconds)
         invite = await telegram_app.bot.create_chat_invite_link(
             chat_id=settings.telegram_paid_group_id,
@@ -718,13 +732,19 @@ async def send_paid_invite(telegram_user_id: int) -> None:
             "created_at": datetime.now(timezone.utc),
             "expire_date": expire_date,
         })
-        await telegram_app.bot.send_message(
-            telegram_user_id,
-            "Payment confirmed. Here is your private AFO Batch group invite link:\n\n"
-            f"{invite.invite_link}\n\nThis link is valid for one student only.",
-        )
+        
+        # Wrap the DM in try...except to catch 'Forbidden' silent crashes
+        try:
+            await telegram_app.bot.send_message(
+                telegram_user_id,
+                "Payment confirmed. Here is your private AFO Batch group invite link:\n\n"
+                f"{invite.invite_link}\n\nThis link is valid for one student only.",
+            )
+        except Exception as dm_err:
+            logger.warning(f"Failed to DM user {telegram_user_id} with invite link: {dm_err}. They might not have started the bot.")
+            
     except Exception as e:
-        logger.error(f"Failed to send paid invite to {telegram_user_id}: {e}")
+        logger.error(f"Failed to create/handle paid invite for {telegram_user_id}: {e}")
 
 # Register Handlers
 telegram_app.add_handler(CommandHandler("start", start))
@@ -815,7 +835,12 @@ async def razorpay_webhook(request: Request):
         )
 
         if payload.get("event") in {"payment.captured", "payment_link.paid"} and telegram_user_id:
-            await db.students.update_one({"telegram_user_id": telegram_user_id}, {"$set": {"paid": True}}, upsert=True)
+            # BUG FIX: Better student paid update
+            await db.students.update_one(
+                {"telegram_user_id": telegram_user_id}, 
+                {"$set": {"paid": True, "paid_at": datetime.now(timezone.utc)}}, 
+                upsert=True
+            )
             await send_paid_invite(telegram_user_id)
 
         return {"ok": True}
