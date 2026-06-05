@@ -596,23 +596,23 @@ async def poll_answer(update: Update, _context) -> None:
         logger.error(f"Database error saving poll answer for {answer.user.id}: {e}")
 
 async def send_leaderboard(run_id) -> None:
-    rows = list(
-        db.responses.aggregate(
-            [
-                {"$match": {"run_id": run_id}},
-                {
-                    "$group": {
-                        "_id": "$telegram_user_id",
-                        "marks": {"$sum": "$marks"},
-                        "attempted": {"$sum": 1},
-                        "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
-                        "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
-                    }
-                },
-                {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
-            ]
-        )
+    # FIX 1: Correctly awaiting the async aggregation cursor
+    cursor = db.responses.aggregate(
+        [
+            {"$match": {"run_id": run_id}},
+            {
+                "$group": {
+                    "_id": "$telegram_user_id",
+                    "marks": {"$sum": "$marks"},
+                    "attempted": {"$sum": 1},
+                    "correct": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
+                    "wrong": {"$sum": {"$cond": ["$is_correct", 0, 1]}},
+                }
+            },
+            {"$sort": {"marks": -1, "correct": -1, "attempted": 1}},
+        ]
     )
+    rows = await cursor.to_list(length=None)
 
     if not rows:
         await telegram_app.bot.send_message(settings.telegram_public_group_id, "No responses received for this test.")
@@ -627,8 +627,12 @@ async def send_leaderboard(run_id) -> None:
     top_3_names = []
     
     for rank, row in enumerate(rows, start=1):
-        student = db.students.find_one({"telegram_user_id": row["_id"]}) or {}
+        # FIX 2: Added 'await' for the async find_one query
+        student = await db.students.find_one({"telegram_user_id": row["_id"]}) or {}
         name = student.get("name") or str(row["_id"])
+        
+        # FIX 3: HTML escape the name to prevent ParseMode.HTML crashes
+        name = html.escape(name)
         
         # Name ko clean rakhne ke liye 25 characters limit tak restrict karna
         name = (name[:25] + '..') if len(name) > 25 else name
@@ -647,13 +651,11 @@ async def send_leaderboard(run_id) -> None:
         else:
             rank_str = f"<b>{rank}.</b>"
         
-        # Added 'Att' (Attempted) here
         line = f"{rank_str} <b>{name}</b>\n└ 🎯 <b>{row['marks']:.2f}</b> | 📝 Att: {row['attempted']} | ✅ {row['correct']} | ❌ {row['wrong']}"
         lines.append(line)
 
     message = ""
     for line in lines:
-        # Telegram character limit check (splits long leaderboards into multiple messages)
         if len(message) + len(line) + 2 > 3800:
             await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
             message = ""
@@ -662,7 +664,7 @@ async def send_leaderboard(run_id) -> None:
     if message:
         await telegram_app.bot.send_message(settings.telegram_public_group_id, message, parse_mode=ParseMode.HTML)
 
-    # Send the Congratulations Message for Top 3 (Without any buttons)
+    # Send the Congratulations Message for Top 3
     if top_3_names:
         congrats_msg = "🎉 <b>CONGRATULATIONS TO OUR TOP 3 RANKERS!</b> 🎉\n\n"
         
@@ -680,7 +682,6 @@ async def send_leaderboard(run_id) -> None:
             congrats_msg, 
             parse_mode=ParseMode.HTML
         )
-
 async def send_promo_message() -> None:
     try:
         bot_username = (await telegram_app.bot.get_me()).username
